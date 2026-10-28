@@ -18,6 +18,15 @@ export { Config }
 export const name = 'dsh-fire-stock'
 export const inject = ['tools']
 
+// 设置页展示用的能力清单（Host 侧唯一事实来源，Client 按此渲染，避免两边各写一份）。
+const CAPABILITIES = [
+  { group: '行情', tools: ['stock_quote', 'stock_kline', 'stock_indicators'] },
+  { group: '热点', tools: ['sector_rank', 'sector_flow', 'limit_up_pool', 'stock_flow', 'dragon_tiger'] },
+  { group: '分析', tools: ['backtest', 'strategy', 'stock_trait', 'stock_finance', 'stock_news'] },
+  { group: '选股', tools: ['screen'] },
+  { group: '自选/盯盘', tools: ['watchlist_add', 'watchlist_remove', 'watchlist_show', 'watch_start', 'watch_stop', 'watch_status', 'watch_alerts'] },
+]
+
 export function apply(ctx, initialConfig = {}) {
   const store = createStore()
 
@@ -31,34 +40,55 @@ export function apply(ctx, initialConfig = {}) {
     }
   }
 
-  // 配置：设置页写入的生效值（config 服务，热更新）> 条目初始值 > schema 默认值。
-  // 0.2.x 已删除 installSection / settingsScope，配置界面改由导出的 Config
-  // schema 自动生成，这里只负责读取生效值。
-  //
-  // 注意（血泪教训）：`ctx.config` 是 cordis 服务，未声明注入时访问会抛
-  // 「cannot get property "config" without inject」。这个 throw 若发生在定时器里
-  // 会变成未捕获异常，直接把宿主进程带走（表现为「启动正常，过一会儿自动退出」）。
-  // 所以：用 ctx.inject 按需接入（拿不到也不阻塞本条目），读取全程 try/catch 兜底。
-  let configCtx = null
-  ctx.inject(['config'], (scoped) => {
-    configCtx = scoped
-    return () => { configCtx = null }
-  })
-  const getConfig = () => {
-    let live
+  // 配置：DSH 0.2.x 没有 `config` 服务（宿主服务目录里只有 settings / configEditor），
+  // 插件自己的配置就挂在 fiber 上：ctx.fiber.config 是校验后的生效值。
+  // .volatile() 字段由 loader 原地写回同一个引用对象（loader/volatile-update），
+  // 所以每次读取都能拿到最新值 —— 设置页保存后立即生效，无需重启宿主。
+  const liveConfig = () => {
     try {
-      live = configCtx ? configCtx.config : undefined
+      return ctx.fiber ? ctx.fiber.config : undefined
     } catch {
-      live = undefined
+      return undefined
     }
-    return resolveConfig(initialConfig, live)
   }
+  const getConfig = () => resolveConfig(initialConfig, liveConfig())
 
   // 盯盘轮询需要自选股，而自选股存在本地 storages 里（不属于配置）。
   startWatcher(ctx, store, {
     quoteFn: quote,
     klineFn: kline,
     getConfig: () => ({ ...getConfig(), watchlist: store.getWatchlist() }),
+  })
+
+  // ---------- 设置页状态接口（同源 GET /dsh-fire-stock/overview）----------
+  // 设置页卡片用它显示自选股 / 盯盘 / 告警的真实状态；取不到时前端静默降级。
+  ctx.inject(['webServer'], (scoped) => {
+    const dispose = scoped.webServer.register({
+      kind: 'exact',
+      path: '/dsh-fire-stock/overview',
+      handler: (req, res) => {
+        const cfg = getConfig()
+        const watch = store.getWatch()
+        const payload = {
+          ok: true,
+          plugin: name,
+          config: cfg,
+          capabilities: CAPABILITIES,
+          watchlistCount: store.getWatchlist().length,
+          watch: {
+            enabled: Boolean(watch.enabled),
+            rules: {
+              changePctThreshold: watch.rules?.changePctThreshold ?? cfg.watchChangePct,
+              volumeRatio: watch.rules?.volumeRatio ?? cfg.watchVolumeRatio,
+            },
+          },
+          alertCount: store.getAlerts(999).length,
+        }
+        res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify(payload))
+      },
+    })
+    return () => dispose()
   })
 
   // ---------- 实时行情 ----------
@@ -139,7 +169,7 @@ export function apply(ctx, initialConfig = {}) {
   // ---------- 板块排名 ----------
   reg(defineTool({
     name: 'sector_rank',
-    description: '行业/概念/地域板块涨跌幅排名（含上涨家数、下跌家数）。用于筛选当日强势/弱势板块。',
+    description: '行业/概念/地域板块涨跌幅排名（含上涨家数、下跌家数）。用于筛选当日强势/弱势板块。东财 push2 不可达时依次降级同花顺（分类更细、带主力净流入）与新浪（更快但无资金流）；region 仅东财提供。',
     parameters: {
       type: { type: 'string', enum: ['industry', 'concept', 'region'], description: '板块类型：industry 行业 / concept 概念 / region 地域，默认 industry' },
       limit: { type: 'integer', description: '返回数量，默认 20，最大 100' },
@@ -158,7 +188,7 @@ export function apply(ctx, initialConfig = {}) {
 
   reg(defineTool({
     name: 'sector_flow',
-    description: '行业/概念/地域板块主力资金净流入排名，用于识别主力资金流向的热点板块。',
+    description: '行业/概念/地域板块主力资金净流入排名，用于识别主力资金流向的热点板块。东财 push2 不可达时自动降级同花顺源：industry/concept 可用，region 不可用，净额为同花顺口径。',
     parameters: {
       type: { type: 'string', enum: ['industry', 'concept', 'region'], description: '板块类型，默认 industry' },
       limit: { type: 'integer', description: '返回数量，默认 20，最大 100' },
@@ -264,7 +294,7 @@ export function apply(ctx, initialConfig = {}) {
   // ---------- 个股资金流 ----------
   reg(defineTool({
     name: 'stock_flow',
-    description: '查询 A 股个股资金流向：主力/超大单/大单/中单/小单净流入（历史日线）。',
+    description: '查询 A 股个股资金流向：主力/超大单/大单/中单/小单净流入（历史日线）。东财不可达时降级新浪源，只返回最近一个交易日的主力净流入。',
     parameters: {
       code: { type: 'string', required: true, description: '6 位股票代码' },
       days: { type: 'integer', description: '返回近 N 个交易日，默认 10，最大 60' },
@@ -329,7 +359,7 @@ export function apply(ctx, initialConfig = {}) {
   // ---------- 条件选股 ----------
   reg(defineTool({
     name: 'screen',
-    description: '条件选股：按涨跌幅/换手率/市盈率/市净率/主力净流入/总市值等对全市场排序取前 100 名，再叠加筛选条件（换手/PE/PB/市值/主力净流入/行业/名称）过滤，返回前 limit 名。',
+    description: '条件选股：按涨跌幅/换手率/市盈率/市净率/主力净流入/总市值等对全市场排序取前 100 名，再叠加筛选条件（换手/PE/PB/市值/主力净流入/行业/名称）过滤，返回前 limit 名。东财 push2 不可达时自动降级新浪源：此时不支持按主力净流入/量比排序，主力净流入与行业字段为空。',
     parameters: {
       sortBy: { type: 'string', enum: ['changePct', 'turnover', 'pe', 'pb', 'mainInflow', 'totalMv', 'volumeRatio'], description: '排序字段，默认 changePct' },
       order: { type: 'string', enum: ['desc', 'asc'], description: '排序方向，默认 desc' },
@@ -531,11 +561,16 @@ function renderIndicators(v) {
 function renderSector(v) {
   const label = { industry: '行业', concept: '概念', region: '地域' }[v.type] || v.type
   const sortLabel = v.sort === 'flow' ? '主力净流入' : '涨跌幅'
+  const source = v.list[0] && v.list[0].source
   const lines = [`${label}板块按${sortLabel}排名（共 ${v.list.length}）：`]
   v.list.forEach((s, i) => {
     const flow = s.mainNetInflow != null ? `${s.mainNetInflow >= 0 ? '+' : ''}${fmtAmount(s.mainNetInflow)}` : '—'
-    lines.push(`${i + 1}. ${s.name}  涨跌 ${fmtPct(s.changePct)}  涨${s.upCount}家/跌${s.downCount}家  主力净流入 ${flow}`)
+    const counts = s.upCount != null && s.downCount != null ? `  涨${s.upCount}家/跌${s.downCount}家` : ''
+    const lead = s.leadName ? `  领涨 ${s.leadName}${s.leadPct != null ? ' ' + fmtPct(s.leadPct) : ''}` : ''
+    lines.push(`${i + 1}. ${s.name}  涨跌 ${fmtPct(s.changePct)}${counts}  主力净流入 ${flow}${lead}`)
   })
+  if (source === 'sina') lines.push('注：东财 push2 不可达，本次为新浪备用源数据（无上涨/下跌家数、无主力净流入）。')
+  else if (source === 'ths') lines.push('注：东财 push2 不可达，本次为同花顺备用源数据（主力净流入为同花顺口径，无上涨/下跌家数）。')
   return lines.join('\n')
 }
 
@@ -563,12 +598,13 @@ function renderWatchlist(v) {
 }
 
 function renderFlow(v) {
-  const sign = (n) => (n >= 0 ? '+' : '')
+  const sign = (n) => (n == null ? '' : n >= 0 ? '+' : '')
   const lines = [`${v.name}(${v.code}) 资金流向（近 ${v.list.length} 日）：`]
   v.list.forEach((x) => {
     lines.push(`${x.date}  主力${sign(x.main)}${fmtAmount(x.main)}  超大${sign(x.superLarge)}${fmtAmount(x.superLarge)}  大${sign(x.large)}${fmtAmount(x.large)}  中${sign(x.medium)}${fmtAmount(x.medium)}  小${sign(x.small)}${fmtAmount(x.small)}`)
   })
   lines.push(`近 ${v.list.length} 日主力累计净流入：${sign(v.totalMain)}${fmtAmount(v.totalMain)}`)
+  if (v.note) lines.push(v.note)
   return lines.join('\n')
 }
 
@@ -611,13 +647,18 @@ function renderFinance(v) {
 }
 
 function renderScreen(v) {
+  const num2 = (x) => (x == null || Number.isNaN(Number(x)) ? '—' : Number(x).toFixed(2))
   const labels = { changePct: '涨跌幅', turnover: '换手率', pe: '市盈率', pb: '市净率', mainInflow: '主力净流入', totalMv: '总市值', volumeRatio: '量比' }
   const lines = [`条件选股结果：全市场按${labels[v.sortBy] || v.sortBy}${v.order === 'asc' ? '升序' : '降序'}前 100 名内，匹配 ${v.matched} 只，取前 ${v.list.length}：`]
   v.list.forEach((s, i) => {
     const inflow = s.mainInflow != null ? (s.mainInflow >= 0 ? '+' : '') + fmtAmount(s.mainInflow) : '—'
-    lines.push(`${i + 1}. ${s.name}(${s.code})  涨跌${fmtPct(s.changePct)}  换手${s.turnover ?? '—'}%  PE${s.pe ?? '—'}  主力${inflow}  市值${s.totalMv != null ? fmtAmount(s.totalMv) : '—'}  ${s.industry || ''}`)
+    const industry = s.industry ? '  ' + s.industry : ''
+    lines.push(`${i + 1}. ${s.name}(${s.code})  涨跌${fmtPct(s.changePct)}  换手${num2(s.turnover)}%  PE${num2(s.pe)}  PB${num2(s.pb)}  主力${inflow}  市值${s.totalMv != null ? fmtAmount(s.totalMv) : '—'}${industry}`)
   })
   if (v.list.length === 0) lines.push('（无匹配标的）')
+  if (v.list.length > 0 && v.list[0].source === 'sina') {
+    lines.push('注：东财 push2 不可达，本次为新浪备用源数据（无主力净流入、无所属行业、无量比）。')
+  }
   return lines.join('\n')
 }
 
@@ -706,11 +747,20 @@ function renderWatch(v) {
   return lines.join('\n')
 }
 
+// ISO(UTC) → 本地时间，避免告警时间比本地慢 8 小时。
+function fmtLocalTime(iso) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return String(iso).slice(0, 19).replace('T', ' ')
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 function renderAlerts(v) {
   const alerts = v.alerts || []
   const lines = [`盯盘告警（共 ${alerts.length} 条，最近在前）：`]
   alerts.forEach((a, i) => {
-    const t = (a.ts || '').slice(0, 19).replace('T', ' ')
+    const t = fmtLocalTime(a.ts)
     const pct = a.changePct != null ? ' ' + fmtPct(a.changePct) : ''
     const price = a.price != null ? ' 现价' + a.price : ''
     lines.push(`${i + 1}. [${t}] ${a.name}(${a.code}) ${a.message}${price}${pct}`)

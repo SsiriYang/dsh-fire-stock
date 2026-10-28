@@ -10,7 +10,11 @@ const PYTHON = process.env.PYTHON || process.env.PYTHON3 || 'python'
 
 export function runAkshare(cmd, args = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    const child = spawn(PYTHON, [PY], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(PYTHON, [PY], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // 双保险：无论系统代码页是什么，子进程一律用 UTF-8 收中文参数。
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    })
     let out = ''
     let err = ''
     const timer = setTimeout(() => child.kill(), timeoutMs)

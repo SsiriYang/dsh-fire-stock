@@ -44,6 +44,17 @@ function expectContains(rel, needle, why) {
   else problems.push(`${rel} 缺少 ${needle}（${why}）`)
 }
 
+function expectAbsent(rel, needle, why) {
+  const abs = join(root, rel)
+  if (!existsSync(abs)) {
+    problems.push(`缺少文件：${rel}`)
+    return
+  }
+  const text = readFileSync(abs, 'utf8')
+  if (!text.includes(needle)) ok.push(`${rel} 不含 ${needle}`)
+  else problems.push(`${rel} 仍含 ${needle}（${why}）`)
+}
+
 // 1) 语法
 checkSyntax('index.js')
 checkSyntax('lib/client.js')
@@ -51,13 +62,37 @@ for (const f of readdirSync(join(root, 'src')).filter((n) => n.endsWith('.js')))
   checkSyntax(join('src', f))
 }
 
-// 2) 客户端 bundle 契约
+// 2) 客户端 bundle 契约（DSH 0.2.1-rc.3）
 expectContains('lib/client.js', 'window.__ModuleLoader__.load', '客户端必须用模块加载器注册')
 expectContains('lib/client.js', 'id: "dsh-fire-stock"', '模块 id 必须与包名一致')
 expectContains('lib/client.js', 'plugins.item', '设置页卡片挂在插件页')
-expectContains('lib/client.js', 'settings.section', '主设置页另注册一份')
+expectContains('lib/client.js', 'whileServed', '卡片必须用 configForms.whileServed 门控命名空间')
 expectContains('lib/client.js', 'settings.fireStock', '本地字典命名空间')
 expectContains('lib/client.js', 'dsh-fire-stock', '配置命名空间必须是包名')
+// settings.section 只接受「整页设置」，塞进去的插件卡片拿不到 useXxxCard 之类的注入属性，
+// 会在页面上渲染成一行报错文本 —— 必须只走 plugins.item。
+expectAbsent('lib/client.js', 'settings.section', '设置分区不再注册第二份，否则设置页多一个报错页')
+
+// 2b) 宿主配置读取契约（DSH 0.2.1-rc.3 没有 config 服务）
+expectAbsent('index.js', "ctx.inject(['config']", '宿主没有 config 服务，注入它永远不触发，设置项会全部失效')
+expectContains('index.js', 'ctx.fiber', '配置必须从插件自己的 fiber 读取（volatile 字段原地更新）')
+
+// 2c) 显示资源（插件页的标题、描述与图标）
+for (const rel of ['locale/zh.json', 'locale/en.json']) {
+  if (!existsSync(join(root, rel))) {
+    problems.push(`缺少文件：${rel}`)
+    continue
+  }
+  try {
+    const meta = JSON.parse(readFileSync(join(root, rel), 'utf8')).meta
+    if (!meta?.title || !meta?.description) problems.push(`${rel} 缺少 meta.title / meta.description`)
+    else ok.push(`${rel} 含 meta.title 与 meta.description`)
+  } catch (e) {
+    problems.push(`${rel} 不是合法 JSON：${e.message}`)
+  }
+}
+if (!existsSync(join(root, 'icon.svg'))) problems.push('缺少文件：icon.svg')
+else ok.push('icon.svg 存在')
 
 // 3) 包元数据契约
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))

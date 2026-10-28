@@ -59,7 +59,15 @@ def finance_abstract(ak, args):
         for c in period_cols:
             row[c] = _num(r[c])
         rows.append(row)
-    return {"periods": period_cols, "indicators": rows}
+    # 摘要里同一指标可能出现多行（不同口径），按指标名去重并保留第一条。
+    seen = set()
+    unique = []
+    for row in rows:
+        if row["indicator"] in seen:
+            continue
+        seen.add(row["indicator"])
+        unique.append(row)
+    return {"periods": period_cols, "indicators": unique}
 
 
 def sector_spot(ak, args):
@@ -68,16 +76,48 @@ def sector_spot(ak, args):
     return df.to_dict("records")
 
 
+def sector_flow(ak, args):
+    """同花顺行业/概念板块资金流（净额单位：亿元 → 转成元）。"""
+    kind = args.get("type", "industry")
+    period = args.get("period", "即时")
+    fn = ak.stock_fund_flow_concept if kind == "concept" else ak.stock_fund_flow_industry
+    df = fn(symbol=period)
+    out = []
+    for _, r in df.iterrows():
+        name = r.get("行业")
+        if not name:
+            continue
+        net_yi = _num(r.get("净额"))
+        in_yi = _num(r.get("流入资金"))
+        out_yi = _num(r.get("流出资金"))
+        out.append({
+            "name": str(name),
+            "changePct": _num(r.get("行业-涨跌幅")),
+            "mainNetInflow": None if net_yi is None else round(float(net_yi) * 1e8, 2),
+            "inflow": None if in_yi is None else round(float(in_yi) * 1e8, 2),
+            "outflow": None if out_yi is None else round(float(out_yi) * 1e8, 2),
+            "companyCount": _num(r.get("公司家数")),
+            "leadName": r.get("领涨股") if isinstance(r.get("领涨股"), str) else "",
+            "leadPct": _num(r.get("领涨股-涨跌幅")),
+        })
+    out.sort(key=lambda x: (x["mainNetInflow"] if x["mainNetInflow"] is not None else -1e18), reverse=True)
+    return out
+
+
 DISPATCH = {
     "lhb": lhb,
     "finance_abstract": finance_abstract,
     "sector_spot": sector_spot,
+    "sector_flow": sector_flow,
 }
 
 
 def main():
     try:
-        req = json.loads(sys.stdin.read())
+        # Windows 控制台默认编码常是 GBK：stdin 必须按 UTF-8 字节解码，
+        # 否则中文参数（如 period="即时"）会变成乱码导致 akshare 拒绝。
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace")
+        req = json.loads(raw)
         cmd = req.get("cmd")
         if cmd not in DISPATCH:
             raise ValueError("unknown cmd: " + str(cmd))

@@ -1,26 +1,45 @@
-// 统一 HTTP 请求：超时 + User-Agent + 错误处理 + 瞬时错误重试。
+// 统一 HTTP 请求：超时 + User-Agent + 错误处理 + 瞬时错误重试 + 文本/GBK 解码。
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 
-export async function getJson(url, { signal, timeoutMs = 10000, headers = {}, retries = 1 } = {}) {
+function mergedSignal(signal, timeoutMs) {
+  const signals = []
+  if (signal) signals.push(signal)
+  if (timeoutMs) signals.push(AbortSignal.timeout(timeoutMs))
+  return signals.length ? AbortSignal.any(signals) : undefined
+}
+
+async function request(url, { signal, timeoutMs = 10000, headers = {}, retries = 1 } = {}) {
   let lastErr
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const signals = []
-      if (signal) signals.push(signal)
-      if (timeoutMs) signals.push(AbortSignal.timeout(timeoutMs))
-      const merged = signals.length ? AbortSignal.any(signals) : undefined
       const res = await fetch(url, {
         headers: { 'User-Agent': UA, Accept: 'application/json,text/plain,*/*', ...headers },
-        signal: merged,
+        signal: mergedSignal(signal, timeoutMs),
       })
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`)
-      return await res.json()
+      return res
     } catch (e) {
       lastErr = e
       if (attempt < retries) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)))
     }
   }
   throw lastErr
+}
+
+export async function getJson(url, opts) {
+  const res = await request(url, opts)
+  return res.json()
+}
+
+/** 按指定编码取文本（腾讯行情是 GBK）。 */
+export async function getText(url, { encoding = 'utf-8', ...opts } = {}) {
+  const res = await request(url, opts)
+  const buf = await res.arrayBuffer()
+  try {
+    return new TextDecoder(encoding).decode(buf)
+  } catch {
+    return new TextDecoder('utf-8').decode(buf)
+  }
 }
 
 // 金额格式化：>=1e8 显示亿，>=1e4 显示万，否则原值。
