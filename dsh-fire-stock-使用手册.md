@@ -34,7 +34,7 @@ dsh plugin --profile desktop add link:D:/AIWork/dsh-fire-stock
 ### 安装（从 Git 仓库）
 
 ```powershell
-dsh plugin --profile desktop add git+https://github.com/fxxg023/dsh-fire-stock.git
+dsh plugin --profile desktop add git+https://github.com/SsiriYang/dsh-fire-stock.git
 ```
 
 ### 升级

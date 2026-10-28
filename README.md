@@ -32,24 +32,27 @@ Prerequisites:
 ### Option 1: install from GitHub
 
 ```sh
-dsh plugin --profile web add github:fxxg023/dsh-fire-stock
+dsh plugin --profile web add github:SsiriYang/dsh-fire-stock
 ```
 
-> Recommended: pin a commit for reproducibility — `dsh plugin --profile web add git+https://github.com/fxxg023/dsh-fire-stock.git#<commit>`
+> Recommended: pin a commit for reproducibility — `dsh plugin --profile web add git+https://github.com/SsiriYang/dsh-fire-stock.git#<commit>`
 
 ### Option 2: local development
 
 ```sh
-git clone https://github.com/fxxg023/dsh-fire-stock.git
+git clone https://github.com/SsiriYang/dsh-fire-stock.git
 cd dsh-fire-stock
-pnpm install && pnpm build      # required: builds lib/client.js
+pnpm install
+pnpm build        # validation only — see note below
 
 # install from a DSH checkout (junction into the source dir: edits are live)
 cd <path-to>/deepseek-harness
 pnpm dsh plugin --profile web add <path-to>/dsh-fire-stock
 ```
 
-> ⚠️ The package declares `exports["./client"]`, so `lib/client.js` MUST exist — otherwise the web boot page reports `Failed to load plugins`. A prebuilt bundle is committed, so GitHub installs need no manual build.
+> ⚠️ `lib/client.js` is **hand-written source**, not a build artifact. It is committed as-is and must not be regenerated: it targets the DSH 0.2.x client API (`ctx.configForms`, `plugins.item` / `settings.section` slots). `pnpm build` only runs `scripts/verify.mjs`, which syntax-checks every runtime file and asserts the bundle's contract (module id, slots, locale namespace, package name, patch id) — so a broken or stale bundle fails the build instead of silently disabling the settings card.
+>
+> The package declares `exports["./client"]`, so `lib/client.js` must exist — otherwise the web boot page reports `Failed to load plugins`. It is committed, so GitHub installs need no build step at all.
 
 ## Usage
 
@@ -64,18 +67,18 @@ Add stocks to the watchlist (via chat tools or the settings section), then:
 ## Project layout
 
 ```
-├── index.js                # host entry: registers 21 tools + settings namespace `stock-assistant`
+├── index.js                # host entry: registers 21 tools + exports the Config schema
 ├── src/                    # data / quant / watch / config (plain ESM JS)
 │   ├── eastmoney.js        # Eastmoney HTTP: quotes, sectors, limit-up pool, money flow
 │   ├── tencent.js          # Tencent adjusted K-lines
 │   ├── akshare.js          # Python subprocess JSON-RPC (dragon-tiger list, financials)
 │   ├── quant.js            # 6-strategy backtest + signal dashboard
 │   ├── profile.js          # stock personality recognition + strategy matching
-│   ├── watch.js store.js notify.js
-│   └── client/             # settings section (TSX, built with tsdown)
-│       └── SettingsCard.tsx
+│   ├── config.js           # Config schema (12 volatile fields) + resolveConfig
+│   └── watch.js store.js notify.js http.js news.js indicators.js
 ├── py/akshare_adapter.py   # akshare stdin/stdout JSON-RPC
-├── lib/client.js           # client bundle (prebuilt, committed)
+├── lib/client.js           # settings card bundle (hand-written, committed)
+├── scripts/verify.mjs      # `pnpm build` = syntax + contract gate
 └── cordis.patch.yml        # plugin mount row
 ```
 
@@ -119,24 +122,27 @@ A 股行情 / 热点 / 量化分析助手 —— [DeepSeek Harness](https://gith
 ### 方式一：从 GitHub 直接安装
 
 ```sh
-dsh plugin --profile web add github:fxxg023/dsh-fire-stock
+dsh plugin --profile web add github:SsiriYang/dsh-fire-stock
 ```
 
-> 推荐固定到某个 commit（更稳妥）：`dsh plugin --profile web add git+https://github.com/fxxg023/dsh-fire-stock.git#<commit>`
+> 推荐固定到某个 commit（更稳妥）：`dsh plugin --profile web add git+https://github.com/SsiriYang/dsh-fire-stock.git#<commit>`
 
 ### 方式二：本地开发
 
 ```sh
-git clone https://github.com/fxxg023/dsh-fire-stock.git
+git clone https://github.com/SsiriYang/dsh-fire-stock.git
 cd dsh-fire-stock
-pnpm install && pnpm build      # 必须构建：生成 lib/client.js
+pnpm install
+pnpm build        # 只做校验，不打包（见下方说明）
 
 # 从 DSH checkout 安装（junction 直连源码目录，改完即时可见）
 cd <path-to>/deepseek-harness
 pnpm dsh plugin --profile web add <path-to>/dsh-fire-stock
 ```
 
-> ⚠️ `package.json` 声明了 `exports["./client"]`，**必须先 `pnpm build` 生成 `lib/client.js`**，否则 web 启动页会报 `Failed to load plugins`。本仓库已提交预构建产物，GitHub 安装无需手动构建。
+> ⚠️ `lib/client.js` 是**手写源码**，不是构建产物，已直接提交进仓库，**不要重新生成**：它针对 DSH 0.2.x 的客户端 API（`ctx.configForms`、`plugins.item` / `settings.section` 槽位）。`pnpm build` 只跑 `scripts/verify.mjs`——对全部运行时代码做语法检查，并断言 bundle 的契约（模块 id、槽位、字典命名空间、包名、patch id），所以一旦 bundle 陈旧或被改坏，build 会失败，而不是等到用户重启后设置卡片静默消失。
+>
+> `package.json` 声明了 `exports["./client"]`，`lib/client.js` 必须存在，否则 web 启动页报 `Failed to load plugins`。该文件已提交，GitHub 安装无需任何构建步骤。
 
 ## 使用
 
@@ -151,18 +157,18 @@ pnpm dsh plugin --profile web add <path-to>/dsh-fire-stock
 ## 项目结构
 
 ```
-├── index.js                # 宿主入口：注册 21 个工具 + settings 命名空间 stock-assistant
+├── index.js                # 宿主入口：注册 21 个工具 + 导出 Config schema
 ├── src/                    # 数据/量化/盯盘/配置（纯 ESM JS）
 │   ├── eastmoney.js        # 东财 HTTP：行情/板块/涨停池/资金流
 │   ├── tencent.js          # 腾讯前复权 K 线
 │   ├── akshare.js          # Python 子进程 JSON-RPC（龙虎榜/财务）
 │   ├── quant.js            # 6 策略回测 + 多空信号
 │   ├── profile.js          # 股性识别 + 策略匹配
-│   ├── watch.js store.js notify.js
-│   └── client/             # 设置页（TSX，tsdown 构建）
-│       └── SettingsCard.tsx
+│   ├── config.js           # 配置 schema（12 个 volatile 字段）+ resolveConfig
+│   └── watch.js store.js notify.js http.js news.js indicators.js
 ├── py/akshare_adapter.py   # akshare stdin/stdout JSON-RPC
-├── lib/client.js           # 客户端 bundle（已构建，提交进仓库）
+├── lib/client.js           # 设置卡片 bundle（手写，提交进仓库）
+├── scripts/verify.mjs      # `pnpm build` = 语法与契约校验
 └── cordis.patch.yml        # 插件挂载行
 ```
 

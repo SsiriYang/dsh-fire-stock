@@ -1,6 +1,6 @@
 {
   "name": "dsh-fire-stock",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "财富自由 FIRE 版 A 股助手：东方财富 + 腾讯行情，行情/热点/技术分析/自选股盯盘（DSH 插件，含设置卡片）",
   "type": "module",
   "main": "index.js",
@@ -13,7 +13,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fxxg023/dsh-fire-stock.git"
+    "url": "git+https://github.com/SsiriYang/dsh-fire-stock.git"
   },
   "keywords": [
     "dsh-plugin",
@@ -44,8 +44,7 @@
     }
   },
   "scripts": {
-    "build": "tsdown",
-    "build:client": "tsdown"
+    "build": "node scripts/verify.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -57,12 +56,5 @@
     "@deepseek-ai/dsh-settings": {
       "optional": true
     }
-  },
-  "devDependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "@types/react": "~18.3.1",
-    "tsdown": "^0.22.14",
-    "typescript": "^5.6.0"
   }
 }
