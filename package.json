@@ -1,0 +1,68 @@
+{
+  "name": "dsh-fire-stock",
+  "version": "2.0.1",
+  "description": "财富自由 FIRE 版 A 股助手：东方财富 + 腾讯行情，行情/热点/技术分析/自选股盯盘（DSH 插件，含设置卡片）",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./client": "./lib/client.js"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fxxg023/dsh-fire-stock.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "stock",
+    "a-share",
+    "fire",
+    "财富自由",
+    "quote"
+  ],
+  "files": [
+    "index.js",
+    "src",
+    "py",
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "build:client": "tsdown"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6 || ^0.2.1-rc.3",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6 || ^0.2.1-rc.3",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@types/react": "~18.3.1",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.6.0"
+  }
+}

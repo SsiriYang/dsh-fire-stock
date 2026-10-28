@@ -1,0 +1,26 @@
+# Node
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python (akshare adapter)
+__pycache__/
+*.py[cod]
+
+# 注意：不要忽略 lib/ —— lib/client.js 是提交进仓库的预构建客户端产物。
+# NOTE: do NOT ignore lib/ — lib/client.js is the committed prebuilt client bundle.
