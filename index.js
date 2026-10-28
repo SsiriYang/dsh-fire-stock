@@ -506,14 +506,17 @@ export function apply(ctx, initialConfig = {}) {
         return { ok: false, action, error: 'IM 插件未加载：ctx.get("dshIm") 不可用（确认 dsh-im 已安装并连接渠道）', targets: [] }
       }
       let targets = []
+      let debug = null
       let listError
       try {
-        targets = await listImTargets(dshIm)
+        const listed = await listImTargets(dshIm)
+        targets = listed.targets
+        debug = listed.debug
       } catch (e) {
         listError = (e && e.message) || String(e)
       }
       if (action === 'list') {
-        return { ok: !listError, action, targets, current: store.getImTarget(), error: listError }
+        return { ok: !listError, action, targets, current: store.getImTarget(), error: listError, debug }
       }
       // set
       let picked = null
@@ -861,6 +864,37 @@ function renderAlerts(v) {
 
 // ---------------- IM 目标辅助 ----------------
 
+/** 把任意返回值转成「无损 JSON」：dshIm 返回的是 cordis 代理对象，不能直接透传。 */
+function toPlainJson(value, depth = 0) {
+  if (value === null || value === undefined) return null
+  const type = typeof value
+  if (type === 'string' || type === 'boolean') return value
+  if (type === 'number') return Number.isFinite(value) ? value : null
+  if (type !== 'object') return null
+  if (depth > 4) return null
+  if (Array.isArray(value)) {
+    return value.map((item) => toPlainJson(item, depth + 1)).filter((item) => item !== null || true)
+  }
+  const out = {}
+  let keys = []
+  try {
+    keys = Object.keys(value)
+  } catch {
+    return null
+  }
+  for (const key of keys) {
+    let v
+    try {
+      v = value[key]
+    } catch {
+      continue
+    }
+    const plain = toPlainJson(v, depth + 1)
+    if (plain !== null || v === null) out[key] = plain
+  }
+  return out
+}
+
 /** 微信渠道状态文件所在目录（best-effort，读不到就当没有）。 */
 function weixinAccountsDir() {
   const home = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -896,41 +930,93 @@ function matchesConversation(target, conversationKey) {
   const key = String(conversationKey)
   const route = target && target.route
   if (!route || typeof route !== 'object') return false
-  return Object.values(route).some((v) => typeof v === 'string' && (key === v || key.endsWith(':' + v)))
+  let values = []
+  try {
+    values = Object.values(route)
+  } catch {
+    return false
+  }
+  return values.some((v) => typeof v === 'string' && (key === v || key.endsWith(':' + v)))
 }
 
-/** 枚举 dshIm 的可用投递目标；对返回结构做兼容，形状不认识就当没有。 */
+/**
+ * 枚举 dshIm 的可用投递目标；返回纯 JSON 结构 + 形状诊断。
+ * dshIm 的对象是 cordis 代理，字段必须逐个取成原始类型，否则宿主会拒收结果。
+ */
 async function listImTargets(dshIm) {
-  const rawBots = await dshIm.listBots()
-  const bots = Array.isArray(rawBots) ? rawBots : rawBots && Array.isArray(rawBots.bots) ? rawBots.bots : []
+  const debug = { botsKind: '', botsCount: 0, botKeys: [], targetKeys: [], errors: [] }
+  let rawBots
+  try {
+    rawBots = await dshIm.listBots()
+  } catch (e) {
+    debug.errors.push('listBots failed: ' + ((e && e.message) || e))
+    return { targets: [], debug }
+  }
+  debug.botsKind = Array.isArray(rawBots) ? 'array' : typeof rawBots
+  const bots = Array.isArray(rawBots)
+    ? rawBots
+    : rawBots && Array.isArray(rawBots.bots)
+      ? rawBots.bots
+      : []
+  debug.botsCount = bots.length
   const out = []
   for (const bot of bots) {
-    const botId = bot && (bot.botId || bot.id)
-    if (!botId) continue
+    let botId = ''
+    try {
+      botId = bot && (bot.botId || bot.id) ? String(bot.botId || bot.id) : ''
+    } catch {
+      botId = ''
+    }
+    if (debug.botKeys.length === 0 && bot) {
+      try { debug.botKeys = Object.keys(bot).slice(0, 12) } catch { /* 忽略 */ }
+    }
+    if (!botId) {
+      debug.errors.push('存在没有 id 的 bot，已跳过')
+      continue
+    }
     let res
     try {
       res = await dshIm.listTargets(botId)
-    } catch {
+    } catch (e) {
+      debug.errors.push('listTargets(' + botId + ') failed: ' + ((e && e.message) || e))
       continue
     }
     const list = Array.isArray(res) ? res : res && Array.isArray(res.targets) ? res.targets : []
+    if (debug.targetKeys.length === 0 && list[0]) {
+      try { debug.targetKeys = Object.keys(list[0]).slice(0, 12) } catch { /* 忽略 */ }
+    }
+    let channel = ''
+    try {
+      channel = String((bot.channel || bot.kind) || (res && res.channel) || '')
+    } catch {
+      channel = ''
+    }
     for (const t of list) {
-      if (!t || !t.targetId) continue
-      out.push({
-        botId,
-        channel: (bot && (bot.channel || bot.kind)) || (res && res.channel) || '',
-        targetId: t.targetId,
-        name: t.name || '',
-        kind: t.kind || '',
-        route: t.route || null,
-      })
+      let targetId = ''
+      let name = ''
+      let kind = ''
+      let route = null
+      try {
+        targetId = t && t.targetId ? String(t.targetId) : ''
+        name = typeof t.name === 'string' ? t.name : ''
+        kind = typeof t.kind === 'string' ? t.kind : ''
+        route = t.route && typeof t.route === 'object' ? toPlainJson(t.route) : null
+      } catch {
+        continue
+      }
+      if (!targetId) continue
+      out.push({ botId, channel, targetId, name, kind, route })
     }
   }
-  return out
+  return { targets: out, debug }
 }
 
 function renderImTarget(v) {
-  if (!v || v.ok === false) return `IM 提醒配置失败：${(v && v.error) || '未知错误'}`
+  if (!v || v.ok === false) {
+    const lines = [`IM 提醒配置失败：${(v && v.error) || '未知错误'}`]
+    if (v && v.debug) lines.push('诊断：' + JSON.stringify(v.debug))
+    return lines.join('\n')
+  }
   if (v.action === 'cleared') return '已清除 IM 提醒目标；盯盘告警只写本地日志 + 桌面通知。'
   if (v.action === 'set') {
     const t = v.target || {}
@@ -938,7 +1024,10 @@ function renderImTarget(v) {
   }
   const list = v.targets || []
   const lines = [`IM 可用投递目标（共 ${list.length}）：`]
-  if (list.length === 0) lines.push('（没有可用目标：确认 dsh-im 已连接渠道，并在 IM 面板里保存过目标）')
+  if (list.length === 0) {
+    lines.push('（没有可用目标：确认 dsh-im 已连接渠道，并在 IM 面板里保存过目标）')
+    if (v.debug) lines.push('诊断：' + JSON.stringify(v.debug))
+  }
   list.forEach((t, i) => {
     const tag = [t.channel, t.kind].filter(Boolean).join('/')
     lines.push(`${i + 1}. ${t.name || '(未命名)'}  bot=${t.botId}  target=${t.targetId}${tag ? '  ' + tag : ''}`)
