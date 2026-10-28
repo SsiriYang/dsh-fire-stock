@@ -1,4 +1,4 @@
-// 本地 JSON 持久化：自选股列表 + 告警日志。
+// 本地 JSON 持久化：自选股列表 + 告警日志 + IM 提醒目标。
 // 存放于 $DSH_HOME/storages/stock-assistant.json（无 DSH_HOME 时回退到 ~/.dsh）。
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -12,7 +12,7 @@ function baseDir() {
 
 export function createStore(filename = 'stock-assistant.json') {
   const file = join(baseDir(), filename)
-  const initial = { watchlist: [], alerts: [] }
+  const initial = { watchlist: [], alerts: [], imTarget: null }
 
   function load() {
     try {
@@ -46,6 +46,16 @@ export function createStore(filename = 'stock-assistant.json') {
       d.watchlist = watchlist
       save(d)
       return d.watchlist
+    },
+    /** 盯盘告警的 IM 投递目标：{ botId, targetId, name } 或 null。 */
+    getImTarget() {
+      return load().imTarget || null
+    },
+    setImTarget(target) {
+      const d = load()
+      d.imTarget = target || null
+      save(d)
+      return d.imTarget
     },
     appendAlert(alert) {
       const d = load()

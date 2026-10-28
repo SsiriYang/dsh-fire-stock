@@ -1,11 +1,11 @@
-// 盯盘定时轮询 + 异动告警：轮询自选股，触发告警写入本地日志 + 桌面通知。
-// 告警触达方式：会话内 + 本地告警日志（经 watch_alerts 读取）+ Windows 桌面气泡通知。
+// 盯盘定时轮询 + 异动告警：轮询自选股，触发告警写入本地日志 + 桌面通知 + IM 推送。
+// 告警触达方式：会话内 + 本地告警日志（经 watch_alerts 读取）+ Windows 桌面气泡 + IM 聊天。
 
 import { notify } from './notify.js'
 
 const COOLDOWN_MS = 30 * 60 * 1000 // 同股同类型告警的冷却时间 30 分钟。
 
-export function startWatcher(ctx, store, { quoteFn, klineFn, getConfig } = {}) {
+export function startWatcher(ctx, store, { quoteFn, klineFn, getConfig, notifyIm } = {}) {
   const quote = quoteFn
   const kline = klineFn
   let running = false
@@ -77,7 +77,7 @@ export function startWatcher(ctx, store, { quoteFn, klineFn, getConfig } = {}) {
               price: q.price,
               changePct: q.changePct,
             })
-            notices.push(`${q.name} ${a.message}`)
+            notices.push(`${q.name || item.name}(${item.code}) ${a.message} 现价 ${q.price}`)
           }
         } catch {
           // 单只行情失败跳过
@@ -86,23 +86,31 @@ export function startWatcher(ctx, store, { quoteFn, klineFn, getConfig } = {}) {
 
       if (notices.length > 0) {
         notify('盯盘告警', notices.slice(0, 5).join('\n'))
+        // IM 推送：失败只记日志，绝不影响盯盘主流程。
+        if (typeof notifyIm === 'function') {
+          try {
+            await notifyIm(`盯盘告警\n${notices.slice(0, 10).join('\n')}`)
+          } catch (e) {
+            console.warn('[dsh-fire-stock] IM 提醒发送失败：' + ((e && e.message) || e))
+          }
+        }
       }
-      } catch {
-        // 轮询链路任何异常都在此终结：定时器里冒出的未捕获异常会直接
-        // 终结宿主进程（表现为「启动正常，过一会儿 DSH 自动退出」）。
-      } finally {
-        running = false
-      }
+    } catch {
+      // 轮询链路任何异常都在此终结：定时器里冒出的未捕获异常会直接
+      // 终结宿主进程（表现为「启动正常，过一会儿 DSH 自动退出」）。
+    } finally {
+      running = false
     }
+  }
 
-    // 双保险：定时器回调自身再兜一层，任何 sync/async 抛出都不外溢。
-    const timer = setInterval(() => {
-      try {
-        poll().catch(() => {})
-      } catch {
-        /* 忽略 */
-      }
-    }, 30000)
+  // 双保险：定时器回调自身再兜一层，任何 sync/async 抛出都不外溢。
+  const timer = setInterval(() => {
+    try {
+      poll().catch(() => {})
+    } catch {
+      /* 忽略 */
+    }
+  }, 30000)
   ctx.effect(() => () => clearInterval(timer))
   return { poll, stop: () => clearInterval(timer) }
 }

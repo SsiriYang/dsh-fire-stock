@@ -11,6 +11,9 @@ import { startWatcher } from './src/watch.js'
 import { createStore } from './src/store.js'
 import { Config, resolveConfig } from './src/config.js'
 import { fmtAmount, fmtPct } from './src/http.js'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 
 // 导出给设置页：新版 SettingsForms 读取 runtime.Config，按 volatile 字段渲染表单。
 export { Config }
@@ -24,11 +27,30 @@ const CAPABILITIES = [
   { group: '热点', tools: ['sector_rank', 'sector_flow', 'limit_up_pool', 'stock_flow', 'dragon_tiger'] },
   { group: '分析', tools: ['backtest', 'strategy', 'stock_trait', 'stock_finance', 'stock_news'] },
   { group: '选股', tools: ['screen'] },
-  { group: '自选/盯盘', tools: ['watchlist_add', 'watchlist_remove', 'watchlist_show', 'watch_start', 'watch_stop', 'watch_status', 'watch_alerts'] },
+  { group: '自选/盯盘', tools: ['watchlist_add', 'watchlist_remove', 'watchlist_show', 'watch_start', 'watch_stop', 'watch_status', 'watch_alerts', 'watch_im_target'] },
 ]
 
 export function apply(ctx, initialConfig = {}) {
   const store = createStore()
+
+  // dsh-im 插件用 ctx.provide('dshIm') 暴露主动投递能力（不是 Service 类，
+  // 所以走 ctx.get 约定式取用；未安装 IM 插件时为 undefined）。
+  const getDshIm = () => {
+    try {
+      return typeof ctx.get === 'function' ? ctx.get('dshIm') : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  // 盯盘告警推送到 IM：未配置目标 / IM 不可用时静默跳过，绝不阻塞盯盘。
+  const pushImAlert = async (text) => {
+    const target = store.getImTarget()
+    if (!target || !target.botId || !target.targetId) return
+    const dshIm = getDshIm()
+    if (!dshIm || typeof dshIm.send !== 'function') throw new Error('IM 插件未加载（dshIm.send 不可用）')
+    await dshIm.send(target.botId, target.targetId, String(text))
+  }
 
   // 同名工具守卫：与其它插件（如 dsh-astock-research）撞名时只跳过这一个工具，
   // 不让整个插件激活失败 —— 否则一处撞名会拖垮应用启动。
@@ -58,6 +80,7 @@ export function apply(ctx, initialConfig = {}) {
     quoteFn: quote,
     klineFn: kline,
     getConfig: () => ({ ...getConfig(), watchlist: store.getWatchlist() }),
+    notifyIm: pushImAlert,
   })
 
   // ---------- 设置页状态接口（同源 GET /dsh-fire-stock/overview）----------
@@ -458,6 +481,68 @@ export function apply(ctx, initialConfig = {}) {
     timeoutMs: 30000,
   }))
 
+  // ---------- IM 提醒目标 ----------
+  reg(defineTool({
+    name: 'watch_im_target',
+    description: '配置盯盘提醒的 IM 投递目标（如微信私聊/群）。action=list 列出可用目标；action=set 用 botId+targetId 指定，或只给 sessionId 让它自动反查绑定的聊天；action=clear 清除。配置后盯盘告警会同时推送到该聊天。',
+    parameters: {
+      action: { type: 'string', enum: ['list', 'set', 'clear'], description: '操作，默认 list' },
+      botId: { type: 'string', description: 'action=set 时的 bot id（list 结果里可查）' },
+      targetId: { type: 'string', description: 'action=set 时的目标 id（list 结果里可查）' },
+      sessionId: { type: 'string', description: 'action=set 时也可只给会话 id，自动反查它绑定的微信聊天' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: renderImTarget(v) }],
+    },
+    execute: async (args) => {
+      const action = args.action || 'list'
+      if (action === 'clear') {
+        store.setImTarget(null)
+        return { ok: true, action: 'cleared', target: null, current: null }
+      }
+      const dshIm = getDshIm()
+      if (!dshIm) {
+        return { ok: false, action, error: 'IM 插件未加载：ctx.get("dshIm") 不可用（确认 dsh-im 已安装并连接渠道）', targets: [] }
+      }
+      let targets = []
+      let listError
+      try {
+        targets = await listImTargets(dshIm)
+      } catch (e) {
+        listError = (e && e.message) || String(e)
+      }
+      if (action === 'list') {
+        return { ok: !listError, action, targets, current: store.getImTarget(), error: listError }
+      }
+      // set
+      let picked = null
+      if (args.botId && args.targetId) {
+        const m = targets.find((t) => t.botId === args.botId && t.targetId === args.targetId)
+        picked = m || { botId: args.botId, targetId: args.targetId, name: '', kind: '', channel: '', route: null }
+      } else if (args.sessionId) {
+        const key = findConversationKey(args.sessionId)
+        if (!key) {
+          return { ok: false, action, error: `未找到 ${args.sessionId} 的 IM 绑定（微信侧状态文件里没有该会话）`, targets }
+        }
+        const matched = targets.filter((t) => matchesConversation(t, key))
+        if (matched.length === 1) picked = matched[0]
+        else if (matched.length === 0) return { ok: false, action, error: `没有与该会话绑定的可投递目标（会话键 ${key}）`, targets }
+        else return { ok: false, action, error: `匹配到 ${matched.length} 个目标，请改用 botId+targetId 指定`, targets: matched }
+      } else {
+        return { ok: false, action, error: 'set 需要 botId+targetId，或提供 sessionId', targets }
+      }
+      store.setImTarget({
+        botId: picked.botId,
+        targetId: picked.targetId,
+        name: picked.name || '',
+        at: new Date().toISOString(),
+      })
+      return { ok: true, action: 'set', target: store.getImTarget(), targets }
+    },
+    timeoutMs: 20000,
+  }))
+
   // ---------- 盯盘 ----------
   reg(defineTool({
     name: 'watch_start',
@@ -503,7 +588,7 @@ export function apply(ctx, initialConfig = {}) {
     execute: async () => {
       const watch = store.getWatch()
       const cfg = getConfig()
-      return { enabled: watch.enabled, rules: { changePctThreshold: watch.rules?.changePctThreshold ?? cfg.watchChangePct, volumeRatio: watch.rules?.volumeRatio ?? cfg.watchVolumeRatio }, watchlistCount: store.getWatchlist().length, alertCount: store.getAlerts(999).length }
+      return { enabled: watch.enabled, rules: { changePctThreshold: watch.rules?.changePctThreshold ?? cfg.watchChangePct, volumeRatio: watch.rules?.volumeRatio ?? cfg.watchVolumeRatio }, watchlistCount: store.getWatchlist().length, alertCount: store.getAlerts(999).length, imTarget: store.getImTarget() }
     },
   }))
 
@@ -517,7 +602,7 @@ export function apply(ctx, initialConfig = {}) {
     execute: async (args) => ({ alerts: store.getAlerts(Math.max(1, Math.min(args.limit ?? 30, 200))) }),
   }))
 
-  console.log('[dsh-fire-stock] 已注册工具: stock_quote, stock_kline, stock_indicators, sector_rank, sector_flow, limit_up_pool, watchlist_add, watchlist_remove, watchlist_show, stock_flow, dragon_tiger, stock_news, stock_finance, screen, backtest, strategy, stock_trait, watch_start, watch_stop, watch_status, watch_alerts')
+  console.log('[dsh-fire-stock] 已注册工具: stock_quote, stock_kline, stock_indicators, sector_rank, sector_flow, limit_up_pool, watchlist_add, watchlist_remove, watchlist_show, stock_flow, dragon_tiger, stock_news, stock_finance, screen, backtest, strategy, stock_trait, watch_start, watch_stop, watch_status, watch_alerts, watch_im_target')
 }
 
 // ---------------- render helpers ----------------
@@ -743,6 +828,11 @@ function renderWatch(v) {
   if (v.rules) lines.push(`规则：涨跌幅阈值 ±${v.rules.changePctThreshold ?? 3}%，放量 ${v.rules.volumeRatio ?? 2} 倍`)
   if (v.watchlistCount != null) lines.push(`自选股 ${v.watchlistCount} 只`)
   if (v.alertCount != null) lines.push(`累计告警 ${v.alertCount} 条`)
+  if ('imTarget' in v) {
+    lines.push(v.imTarget
+      ? `IM 提醒：${v.imTarget.name || v.imTarget.targetId}（bot ${v.imTarget.botId}）`
+      : 'IM 提醒：未配置（用 watch_im_target 设置）')
+  }
   if (v.note) lines.push(v.note)
   return lines.join('\n')
 }
@@ -766,5 +856,94 @@ function renderAlerts(v) {
     lines.push(`${i + 1}. [${t}] ${a.name}(${a.code}) ${a.message}${price}${pct}`)
   })
   if (alerts.length === 0) lines.push('（暂无告警）')
+  return lines.join('\n')
+}
+
+// ---------------- IM 目标辅助 ----------------
+
+/** 微信渠道状态文件所在目录（best-effort，读不到就当没有）。 */
+function weixinAccountsDir() {
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, 'integrations', 'dsh-weixin', 'accounts')
+}
+
+/** 从微信侧状态文件反查「会话 id → 聊天键」，找不到返回 null。 */
+function findConversationKey(sessionId) {
+  const root = weixinAccountsDir()
+  let dirs = []
+  try {
+    dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
+  } catch {
+    return null
+  }
+  for (const dir of dirs) {
+    try {
+      const state = JSON.parse(readFileSync(join(root, dir, 'state.json'), 'utf8'))
+      const sessions = state && state.sessions
+      if (!sessions || typeof sessions !== 'object') continue
+      for (const [key, value] of Object.entries(sessions)) {
+        if (value === sessionId) return key
+      }
+    } catch {
+      // 单个账号读失败不影响其它账号
+    }
+  }
+  return null
+}
+
+/** 会话键与投递目标是否指向同一个聊天：weixin 的键是 p2p:<toUserId>，目标 route 里带 toUserId。 */
+function matchesConversation(target, conversationKey) {
+  const key = String(conversationKey)
+  const route = target && target.route
+  if (!route || typeof route !== 'object') return false
+  return Object.values(route).some((v) => typeof v === 'string' && (key === v || key.endsWith(':' + v)))
+}
+
+/** 枚举 dshIm 的可用投递目标；对返回结构做兼容，形状不认识就当没有。 */
+async function listImTargets(dshIm) {
+  const rawBots = await dshIm.listBots()
+  const bots = Array.isArray(rawBots) ? rawBots : rawBots && Array.isArray(rawBots.bots) ? rawBots.bots : []
+  const out = []
+  for (const bot of bots) {
+    const botId = bot && (bot.botId || bot.id)
+    if (!botId) continue
+    let res
+    try {
+      res = await dshIm.listTargets(botId)
+    } catch {
+      continue
+    }
+    const list = Array.isArray(res) ? res : res && Array.isArray(res.targets) ? res.targets : []
+    for (const t of list) {
+      if (!t || !t.targetId) continue
+      out.push({
+        botId,
+        channel: (bot && (bot.channel || bot.kind)) || (res && res.channel) || '',
+        targetId: t.targetId,
+        name: t.name || '',
+        kind: t.kind || '',
+        route: t.route || null,
+      })
+    }
+  }
+  return out
+}
+
+function renderImTarget(v) {
+  if (!v || v.ok === false) return `IM 提醒配置失败：${(v && v.error) || '未知错误'}`
+  if (v.action === 'cleared') return '已清除 IM 提醒目标；盯盘告警只写本地日志 + 桌面通知。'
+  if (v.action === 'set') {
+    const t = v.target || {}
+    return `IM 提醒目标已保存：${t.name || '(未命名)'}\nbot=${t.botId}  target=${t.targetId}\n之后盯盘告警会同时推送到该聊天。`
+  }
+  const list = v.targets || []
+  const lines = [`IM 可用投递目标（共 ${list.length}）：`]
+  if (list.length === 0) lines.push('（没有可用目标：确认 dsh-im 已连接渠道，并在 IM 面板里保存过目标）')
+  list.forEach((t, i) => {
+    const tag = [t.channel, t.kind].filter(Boolean).join('/')
+    lines.push(`${i + 1}. ${t.name || '(未命名)'}  bot=${t.botId}  target=${t.targetId}${tag ? '  ' + tag : ''}`)
+  })
+  if (v.current) lines.push(`当前目标：${v.current.name || v.current.targetId}（bot=${v.current.botId}）`)
+  else lines.push('当前未配置目标：用 action=set 指定 botId+targetId，或传 sessionId 自动反查。')
   return lines.join('\n')
 }
