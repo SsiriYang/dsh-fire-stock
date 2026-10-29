@@ -106,6 +106,15 @@ export function apply(ctx, initialConfig = {}) {
             },
           },
           alertCount: store.getAlerts(999).length,
+          recentAlerts: store.getAlerts(5).map((a) => ({
+            ts: a.ts,
+            code: a.code,
+            name: a.name,
+            type: a.type,
+            message: a.message,
+            price: a.price,
+            changePct: a.changePct,
+          })),
         }
         res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify(payload))
