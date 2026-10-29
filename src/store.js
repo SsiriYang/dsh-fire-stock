@@ -47,7 +47,17 @@ export function createStore(filename = 'stock-assistant.json') {
       save(d)
       return d.watchlist
     },
-    /** 盯盘告警的 IM 投递目标：{ botId, targetId, name } 或 null。 */
+    /** 最近一次 IM 推送结果：{ at, ok, via, error }，用于设置页/状态排查。 */
+    getLastPush() {
+      return load().lastPush || null
+    },
+    setLastPush(result) {
+      const d = load()
+      d.lastPush = result || null
+      save(d)
+      return d.lastPush
+    },
+    /** 盯盘告警的 IM 投递目标：{ botId, toUserId, targetId?, name } 或 null。 */
     getImTarget() {
       return load().imTarget || null
     },

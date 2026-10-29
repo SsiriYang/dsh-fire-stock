@@ -44,17 +44,50 @@ export function apply(ctx, initialConfig = {}) {
   }
 
   // 盯盘告警推送到 IM：未配置目标 / IM 不可用时静默跳过，绝不阻塞盯盘。
+  // 盯盘告警推送到 IM。三路尝试：已记住的 targetId → draft target → 现场解析 targetId 后重试。
+  // 结果写入 store.lastPush，便于从 overview / watch_status 排查（宿主没有日志目录）。
   const pushImAlert = async (text) => {
     const target = store.getImTarget()
-    if (!target || !target.botId || !target.toUserId) return
+    if (!target || !target.botId) return
+    const body = String(text)
+    const record = (ok, via, error) => {
+      store.setLastPush({ at: new Date().toISOString(), ok, via: via || '', error: error ? String(error).slice(0, 400) : '' })
+    }
     const dshIm = getDshIm()
-    if (!dshIm || typeof dshIm.send !== 'function') throw new Error('IM 插件未加载（dshIm.send 不可用）')
-    // draft target：无需预先创建投放目标，直接按 toUserId 投递到该微信会话
-    await dshIm.send(
-      target.botId,
-      { name: target.name || '微信', kind: 'user', route: { toUserId: target.toUserId } },
-      String(text),
-    )
+    if (!dshIm || typeof dshIm.send !== 'function') {
+      record(false, 'none', 'IM 插件未加载（dshIm.send 不可用）')
+      throw new Error('IM 插件未加载（dshIm.send 不可用）')
+    }
+    const draft = target.toUserId
+      ? { name: target.name || '微信', kind: 'user', route: { toUserId: target.toUserId } }
+      : null
+    const attempts = []
+    if (target.targetId) attempts.push({ via: 'targetId', arg: target.targetId })
+    if (draft) attempts.push({ via: 'draft', arg: draft })
+    let lastError = null
+    for (const attempt of attempts) {
+      try {
+        await dshIm.send(target.botId, attempt.arg, body)
+        record(true, attempt.via)
+        return
+      } catch (e) {
+        lastError = e
+      }
+    }
+    // 兜底：现场用 listTargets 解析出真实 targetId 再试一次
+    try {
+      const resolved = await resolveTargetId(dshIm, target.botId, target.toUserId)
+      if (resolved) {
+        await dshIm.send(target.botId, resolved, body)
+        store.setImTarget({ ...target, targetId: resolved })
+        record(true, 'resolved')
+        return
+      }
+    } catch (e) {
+      lastError = lastError || e
+    }
+    record(false, 'all', (lastError && (lastError.code || lastError.message)) || 'unknown')
+    throw lastError || new Error('IM 投递失败')
   }
 
   // 同名工具守卫：与其它插件（如 dsh-astock-research）撞名时只跳过这一个工具，
@@ -111,6 +144,8 @@ export function apply(ctx, initialConfig = {}) {
             },
           },
           alertCount: store.getAlerts(999).length,
+          imTarget: store.getImTarget(),
+          lastPush: store.getLastPush(),
           recentAlerts: store.getAlerts(5).map((a) => ({
             ts: a.ts,
             code: a.code,
@@ -603,7 +638,7 @@ export function apply(ctx, initialConfig = {}) {
     execute: async () => {
       const watch = store.getWatch()
       const cfg = getConfig()
-      return { enabled: watch.enabled, rules: { changePctThreshold: watch.rules?.changePctThreshold ?? cfg.watchChangePct, volumeRatio: watch.rules?.volumeRatio ?? cfg.watchVolumeRatio }, watchlistCount: store.getWatchlist().length, alertCount: store.getAlerts(999).length, imTarget: store.getImTarget() }
+      return { enabled: watch.enabled, rules: { changePctThreshold: watch.rules?.changePctThreshold ?? cfg.watchChangePct, volumeRatio: watch.rules?.volumeRatio ?? cfg.watchVolumeRatio }, watchlistCount: store.getWatchlist().length, alertCount: store.getAlerts(999).length, imTarget: store.getImTarget(), lastPush: store.getLastPush() }
     },
   }))
 
@@ -848,6 +883,13 @@ function renderWatch(v) {
       ? `IM 提醒：${v.imTarget.name || '微信'}（bot ${v.imTarget.botId} → ${v.imTarget.toUserId}）`
       : 'IM 提醒：未配置（用 watch_im_target 设置）')
   }
+  if (v.lastPush) {
+    const p = v.lastPush
+    const t = fmtLocalTime(p.at).slice(5, 16)
+    lines.push(p.ok
+      ? `最近推送：${t} 成功（${p.via}）`
+      : `最近推送：${t} 失败（${p.via}）：${p.error || '未知原因'}`)
+  }
   if (v.note) lines.push(v.note)
   return lines.join('\n')
 }
@@ -943,6 +985,30 @@ function listWeixinAccounts() {
       conversationKey: keyByOwner.get(a.ownerUserId) || '',
       name: '微信 ' + (typeof a.accountId === 'string' ? a.accountId.slice(0, 10) : a.botId.slice(0, 10)),
     }))
+}
+
+/** 用 dshIm.listTargets 现场解析真实 targetId（按 toUserId 匹配），解析不到返回空串。 */
+async function resolveTargetId(dshIm, botId, toUserId) {
+  if (!toUserId || typeof dshIm.listTargets !== 'function') return ''
+  const res = await dshIm.listTargets(botId)
+  const list = Array.isArray(res) ? res : res && Array.isArray(res.targets) ? res.targets : []
+  for (const t of list) {
+    let route = null
+    let id = ''
+    try {
+      route = t && t.route
+      id = t && t.targetId ? String(t.targetId) : ''
+    } catch {
+      continue
+    }
+    if (!id || !route) continue
+    try {
+      if (route.toUserId === toUserId) return id
+    } catch {
+      // 忽略单个目标的读取异常
+    }
+  }
+  return ''
 }
 
 /** 从微信侧状态文件反查「会话 id → 聊天键」，找不到返回 null。 */
