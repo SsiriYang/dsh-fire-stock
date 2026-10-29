@@ -1,6 +1,6 @@
 {
   "name": "dsh-fire-stock",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "财富自由 FIRE 版 A 股助手：东方财富 + 腾讯行情，行情/热点/技术分析/自选股盯盘（DSH 插件，含设置卡片）",
   "type": "module",
   "main": "index.js",

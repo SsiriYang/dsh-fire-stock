@@ -58,8 +58,10 @@ export function apply(ctx, initialConfig = {}) {
       record(false, 'none', 'IM 插件未加载（dshIm.send 不可用）')
       throw new Error('IM 插件未加载（dshIm.send 不可用）')
     }
+    // 注意：dshIm 的 draftTargetObject 要求「恰好 kind + route 两个键」，
+    // 多带 name 会被判为 bad-request（Invalid draft target）。
     const draft = target.toUserId
-      ? { name: target.name || '微信', kind: 'user', route: { toUserId: target.toUserId } }
+      ? { kind: 'user', route: { toUserId: target.toUserId } }
       : null
     const attempts = []
     if (target.targetId) attempts.push({ via: 'targetId', arg: target.targetId })
@@ -86,7 +88,10 @@ export function apply(ctx, initialConfig = {}) {
     } catch (e) {
       lastError = lastError || e
     }
-    record(false, 'all', (lastError && (lastError.code || lastError.message)) || 'unknown')
+    const reason = lastError
+      ? [(lastError.code || ''), (lastError.message || '')].filter(Boolean).join(': ') || String(lastError)
+      : 'unknown'
+    record(false, 'all', reason)
     throw lastError || new Error('IM 投递失败')
   }
 
