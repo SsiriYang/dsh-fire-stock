@@ -46,10 +46,15 @@ export function apply(ctx, initialConfig = {}) {
   // 盯盘告警推送到 IM：未配置目标 / IM 不可用时静默跳过，绝不阻塞盯盘。
   const pushImAlert = async (text) => {
     const target = store.getImTarget()
-    if (!target || !target.botId || !target.targetId) return
+    if (!target || !target.botId || !target.toUserId) return
     const dshIm = getDshIm()
     if (!dshIm || typeof dshIm.send !== 'function') throw new Error('IM 插件未加载（dshIm.send 不可用）')
-    await dshIm.send(target.botId, target.targetId, String(text))
+    // draft target：无需预先创建投放目标，直接按 toUserId 投递到该微信会话
+    await dshIm.send(
+      target.botId,
+      { name: target.name || '微信', kind: 'user', route: { toUserId: target.toUserId } },
+      String(text),
+    )
   }
 
   // 同名工具守卫：与其它插件（如 dsh-astock-research）撞名时只跳过这一个工具，
@@ -491,14 +496,17 @@ export function apply(ctx, initialConfig = {}) {
   }))
 
   // ---------- IM 提醒目标 ----------
+  // dshIm.send 支持 draft target（{kind, route}），所以直接按微信账号的
+  // ownerUserId 投递：不需要预先在 IM 面板创建投放目标，也不依赖
+  // listBots/listTargets（那两个返回 cordis 代理对象，不好序列化）。
   reg(defineTool({
     name: 'watch_im_target',
-    description: '配置盯盘提醒的 IM 投递目标（如微信私聊/群）。action=list 列出可用目标；action=set 用 botId+targetId 指定，或只给 sessionId 让它自动反查绑定的聊天；action=clear 清除。配置后盯盘告警会同时推送到该聊天。',
+    description: '配置盯盘提醒的 IM 投递目标（微信）。action=list 列出已登录的微信账号及各自绑定的会话；action=set 用 sessionId 自动匹配账号，或用 botId+toUserId 指定；action=clear 清除。配置后盯盘告警会推送到该微信会话。',
     parameters: {
       action: { type: 'string', enum: ['list', 'set', 'clear'], description: '操作，默认 list' },
-      botId: { type: 'string', description: 'action=set 时的 bot id（list 结果里可查）' },
-      targetId: { type: 'string', description: 'action=set 时的目标 id（list 结果里可查）' },
-      sessionId: { type: 'string', description: 'action=set 时也可只给会话 id，自动反查它绑定的微信聊天' },
+      botId: { type: 'string', description: 'action=set 时的微信账号 botId（list 结果里可查）' },
+      toUserId: { type: 'string', description: 'action=set 时的微信用户 id，形如 xxx@im.wechat' },
+      sessionId: { type: 'string', description: 'action=set 时也可只给会话 id，自动匹配绑定它的微信账号' },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
@@ -508,51 +516,46 @@ export function apply(ctx, initialConfig = {}) {
       const action = args.action || 'list'
       if (action === 'clear') {
         store.setImTarget(null)
-        return { ok: true, action: 'cleared', target: null, current: null }
+        return cleanValue({ ok: true, action: 'cleared', target: null })
       }
-      const dshIm = getDshIm()
-      if (!dshIm) {
-        return { ok: false, action, error: 'IM 插件未加载：ctx.get("dshIm") 不可用（确认 dsh-im 已安装并连接渠道）', targets: [] }
-      }
-      let targets = []
-      let debug = null
-      let listError
+      let accounts = []
       try {
-        const listed = await listImTargets(dshIm)
-        targets = listed.targets
-        debug = listed.debug
+        accounts = listWeixinAccounts()
       } catch (e) {
-        listError = (e && e.message) || String(e)
+        return cleanValue({ ok: false, action, error: '读取微信账号失败：' + ((e && e.message) || e) })
       }
       if (action === 'list') {
-        return { ok: !listError, action, targets, current: store.getImTarget(), error: listError, debug }
+        return cleanValue({ ok: true, action, accounts, current: store.getImTarget() })
       }
       // set
       let picked = null
-      if (args.botId && args.targetId) {
-        const m = targets.find((t) => t.botId === args.botId && t.targetId === args.targetId)
-        picked = m || { botId: args.botId, targetId: args.targetId, name: '', kind: '', channel: '', route: null }
-      } else if (args.sessionId) {
+      if (args.sessionId) {
         const key = findConversationKey(args.sessionId)
-        if (!key) {
-          return { ok: false, action, error: `未找到 ${args.sessionId} 的 IM 绑定（微信侧状态文件里没有该会话）`, targets }
+        const bound = accounts.filter((a) => (key && a.conversationKey === key) || (key && key === 'p2p:' + a.ownerUserId))
+        if (bound.length === 1) picked = bound[0]
+        else if (bound.length === 0) {
+          return cleanValue({ ok: false, action, error: '没有微信账号绑定到会话 ' + args.sessionId + '（会话键 ' + (key || '未找到') + '）', accounts })
+        } else {
+          return cleanValue({ ok: false, action, error: '有 ' + bound.length + ' 个账号都指向该会话，请用 botId+toUserId 指定', accounts })
         }
-        const matched = targets.filter((t) => matchesConversation(t, key))
-        if (matched.length === 1) picked = matched[0]
-        else if (matched.length === 0) return { ok: false, action, error: `没有与该会话绑定的可投递目标（会话键 ${key}）`, targets }
-        else return { ok: false, action, error: `匹配到 ${matched.length} 个目标，请改用 botId+targetId 指定`, targets: matched }
+      } else if (args.botId && args.toUserId) {
+        const known = accounts.find((a) => a.botId === args.botId)
+        picked = known || { botId: args.botId, ownerUserId: args.toUserId, conversationKey: '', accountId: '' }
+        if (!picked.ownerUserId) picked.ownerUserId = args.toUserId
       } else {
-        return { ok: false, action, error: 'set 需要 botId+targetId，或提供 sessionId', targets }
+        return cleanValue({ ok: false, action, error: 'set 需要 sessionId，或 botId+toUserId', accounts })
       }
+      const toUserId = args.toUserId || picked.ownerUserId
+      if (!toUserId) return cleanValue({ ok: false, action, error: '缺少 toUserId（微信用户 id）', accounts })
       store.setImTarget({
         botId: picked.botId,
-        targetId: picked.targetId,
-        name: picked.name || '',
+        toUserId,
+        name: picked.name || '微信',
         at: new Date().toISOString(),
       })
-      return { ok: true, action: 'set', target: store.getImTarget(), targets }
+      return cleanValue({ ok: true, action: 'set', target: store.getImTarget() })
     },
-    timeoutMs: 20000,
+    timeoutMs: 15000,
   }))
 
   // ---------- 盯盘 ----------
@@ -842,7 +845,7 @@ function renderWatch(v) {
   if (v.alertCount != null) lines.push(`累计告警 ${v.alertCount} 条`)
   if ('imTarget' in v) {
     lines.push(v.imTarget
-      ? `IM 提醒：${v.imTarget.name || v.imTarget.targetId}（bot ${v.imTarget.botId}）`
+      ? `IM 提醒：${v.imTarget.name || '微信'}（bot ${v.imTarget.botId} → ${v.imTarget.toUserId}）`
       : 'IM 提醒：未配置（用 watch_im_target 设置）')
   }
   if (v.note) lines.push(v.note)
@@ -873,41 +876,73 @@ function renderAlerts(v) {
 
 // ---------------- IM 目标辅助 ----------------
 
-/** 把任意返回值转成「无损 JSON」：dshIm 返回的是 cordis 代理对象，不能直接透传。 */
-function toPlainJson(value, depth = 0) {
-  if (value === null || value === undefined) return null
-  const type = typeof value
-  if (type === 'string' || type === 'boolean') return value
-  if (type === 'number') return Number.isFinite(value) ? value : null
-  if (type !== 'object') return null
-  if (depth > 4) return null
-  if (Array.isArray(value)) {
-    return value.map((item) => toPlainJson(item, depth + 1)).filter((item) => item !== null || true)
-  }
-  const out = {}
-  let keys = []
+/**
+ * 保证工具返回值是无损 JSON：丢掉 undefined 字段、非有限数值归 null。
+ * 宿主对 undefined / Symbol / 函数这类值会直接拒收（value is not lossless JSON）。
+ */
+function cleanValue(value) {
   try {
-    keys = Object.keys(value)
+    return JSON.parse(JSON.stringify(value === undefined ? null : value))
   } catch {
     return null
   }
-  for (const key of keys) {
-    let v
-    try {
-      v = value[key]
-    } catch {
-      continue
-    }
-    const plain = toPlainJson(v, depth + 1)
-    if (plain !== null || v === null) out[key] = plain
-  }
-  return out
 }
 
-/** 微信渠道状态文件所在目录（best-effort，读不到就当没有）。 */
+/** DSH home 目录。 */
+function dshHomeDir() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+/** 微信渠道配置文件（含已登录账号的 botId / ownerUserId）。 */
+function weixinConfigPath() {
+  return join(dshHomeDir(), 'integrations', 'dsh-weixin', 'config.json')
+}
+
+/** 微信渠道会话状态目录。 */
 function weixinAccountsDir() {
-  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-  return join(home, 'integrations', 'dsh-weixin', 'accounts')
+  return join(dshHomeDir(), 'integrations', 'dsh-weixin', 'accounts')
+}
+
+/** 从各账号 state.json 收集「ownerUserId → 会话键」，例如 o9cq…@im.wechat → p2p:o9cq…@im.wechat。 */
+function readOwnerConversationKeys() {
+  const map = new Map()
+  const root = weixinAccountsDir()
+  let dirs = []
+  try {
+    dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
+  } catch {
+    return map
+  }
+  for (const dir of dirs) {
+    try {
+      const state = JSON.parse(readFileSync(join(root, dir, 'state.json'), 'utf8'))
+      const sessions = state && state.sessions
+      if (!sessions || typeof sessions !== 'object') continue
+      for (const [key, value] of Object.entries(sessions)) {
+        if (typeof value !== 'string') continue
+        if (key.startsWith('p2p:')) map.set(key.slice(4), key)
+      }
+    } catch {
+      // 单个账号读失败不影响其它账号
+    }
+  }
+  return map
+}
+
+/** 列出已登录的微信账号（botId / ownerUserId / 绑定的会话键）。 */
+function listWeixinAccounts() {
+  const cfg = JSON.parse(readFileSync(weixinConfigPath(), 'utf8'))
+  const accounts = Array.isArray(cfg.accounts) ? cfg.accounts : []
+  const keyByOwner = readOwnerConversationKeys()
+  return accounts
+    .filter((a) => a && typeof a.botId === 'string' && typeof a.ownerUserId === 'string')
+    .map((a) => ({
+      botId: a.botId,
+      accountId: typeof a.accountId === 'string' ? a.accountId : '',
+      ownerUserId: a.ownerUserId,
+      conversationKey: keyByOwner.get(a.ownerUserId) || '',
+      name: '微信 ' + (typeof a.accountId === 'string' ? a.accountId.slice(0, 10) : a.botId.slice(0, 10)),
+    }))
 }
 
 /** 从微信侧状态文件反查「会话 id → 聊天键」，找不到返回 null。 */
@@ -934,114 +969,22 @@ function findConversationKey(sessionId) {
   return null
 }
 
-/** 会话键与投递目标是否指向同一个聊天：weixin 的键是 p2p:<toUserId>，目标 route 里带 toUserId。 */
-function matchesConversation(target, conversationKey) {
-  const key = String(conversationKey)
-  const route = target && target.route
-  if (!route || typeof route !== 'object') return false
-  let values = []
-  try {
-    values = Object.values(route)
-  } catch {
-    return false
-  }
-  return values.some((v) => typeof v === 'string' && (key === v || key.endsWith(':' + v)))
-}
-
-/**
- * 枚举 dshIm 的可用投递目标；返回纯 JSON 结构 + 形状诊断。
- * dshIm 的对象是 cordis 代理，字段必须逐个取成原始类型，否则宿主会拒收结果。
- */
-async function listImTargets(dshIm) {
-  const debug = { botsKind: '', botsCount: 0, botKeys: [], targetKeys: [], errors: [] }
-  let rawBots
-  try {
-    rawBots = await dshIm.listBots()
-  } catch (e) {
-    debug.errors.push('listBots failed: ' + ((e && e.message) || e))
-    return { targets: [], debug }
-  }
-  debug.botsKind = Array.isArray(rawBots) ? 'array' : typeof rawBots
-  const bots = Array.isArray(rawBots)
-    ? rawBots
-    : rawBots && Array.isArray(rawBots.bots)
-      ? rawBots.bots
-      : []
-  debug.botsCount = bots.length
-  const out = []
-  for (const bot of bots) {
-    let botId = ''
-    try {
-      botId = bot && (bot.botId || bot.id) ? String(bot.botId || bot.id) : ''
-    } catch {
-      botId = ''
-    }
-    if (debug.botKeys.length === 0 && bot) {
-      try { debug.botKeys = Object.keys(bot).slice(0, 12) } catch { /* 忽略 */ }
-    }
-    if (!botId) {
-      debug.errors.push('存在没有 id 的 bot，已跳过')
-      continue
-    }
-    let res
-    try {
-      res = await dshIm.listTargets(botId)
-    } catch (e) {
-      debug.errors.push('listTargets(' + botId + ') failed: ' + ((e && e.message) || e))
-      continue
-    }
-    const list = Array.isArray(res) ? res : res && Array.isArray(res.targets) ? res.targets : []
-    if (debug.targetKeys.length === 0 && list[0]) {
-      try { debug.targetKeys = Object.keys(list[0]).slice(0, 12) } catch { /* 忽略 */ }
-    }
-    let channel = ''
-    try {
-      channel = String((bot.channel || bot.kind) || (res && res.channel) || '')
-    } catch {
-      channel = ''
-    }
-    for (const t of list) {
-      let targetId = ''
-      let name = ''
-      let kind = ''
-      let route = null
-      try {
-        targetId = t && t.targetId ? String(t.targetId) : ''
-        name = typeof t.name === 'string' ? t.name : ''
-        kind = typeof t.kind === 'string' ? t.kind : ''
-        route = t.route && typeof t.route === 'object' ? toPlainJson(t.route) : null
-      } catch {
-        continue
-      }
-      if (!targetId) continue
-      out.push({ botId, channel, targetId, name, kind, route })
-    }
-  }
-  return { targets: out, debug }
-}
-
 function renderImTarget(v) {
-  if (!v || v.ok === false) {
-    const lines = [`IM 提醒配置失败：${(v && v.error) || '未知错误'}`]
-    if (v && v.debug) lines.push('诊断：' + JSON.stringify(v.debug))
-    return lines.join('\n')
-  }
-  if (v.action === 'cleared') return '已清除 IM 提醒目标；盯盘告警只写本地日志 + 桌面通知。'
+  if (!v || v.ok === false) return `IM 提醒配置失败：${(v && v.error) || '未知错误'}`
+  if (v.action === 'cleared') return '已清除 IM 提醒目标；盯盘告警只写本地日志 + 页面告警列表。'
   if (v.action === 'set') {
     const t = v.target || {}
-    return `IM 提醒目标已保存：${t.name || '(未命名)'}\nbot=${t.botId}  target=${t.targetId}\n之后盯盘告警会同时推送到该聊天。`
+    return `IM 提醒目标已保存：${t.name || '微信'}\nbot=${t.botId} → ${t.toUserId}\n之后盯盘告警会推送到该微信会话。`
   }
-  const list = v.targets || []
-  const lines = [`IM 可用投递目标（共 ${list.length}）：`]
-  if (list.length === 0) {
-    lines.push('（没有可用目标：确认 dsh-im 已连接渠道，并在 IM 面板里保存过目标）')
-    if (v.debug) lines.push('诊断：' + JSON.stringify(v.debug))
-  }
-  list.forEach((t, i) => {
-    const tag = [t.channel, t.kind].filter(Boolean).join('/')
-    lines.push(`${i + 1}. ${t.name || '(未命名)'}  bot=${t.botId}  target=${t.targetId}${tag ? '  ' + tag : ''}`)
+  const accounts = v.accounts || []
+  const lines = [`已登录的微信账号（${accounts.length}）：`]
+  if (accounts.length === 0) lines.push('（没有已登录账号：在 IM 面板里扫码登录微信）')
+  accounts.forEach((a, i) => {
+    lines.push(`${i + 1}. ${a.name}  bot=${a.botId}`)
+    lines.push(`   owner=${a.ownerUserId}${a.conversationKey ? '  已绑定会话 ' + a.conversationKey : '  （暂无绑定会话）'}`)
   })
-  if (v.current) lines.push(`当前目标：${v.current.name || v.current.targetId}（bot=${v.current.botId}）`)
-  else lines.push('当前未配置目标：用 action=set 指定 botId+targetId，或传 sessionId 自动反查。')
+  const cur = v.current
+  if (cur) lines.push(`当前目标：${cur.name || '微信'}（bot=${cur.botId} → ${cur.toUserId}）`)
+  else lines.push('当前未配置目标：用 action=set 传 sessionId 或 botId+toUserId。')
   return lines.join('\n')
 }
